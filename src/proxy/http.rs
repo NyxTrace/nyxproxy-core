@@ -3,8 +3,9 @@ use std::convert::Infallible;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper::service::service_fn;
-use hyper::{Request, Response, Method, StatusCode};
-use http_body_util::Full;
+use hyper::{Request, Response, Method, StatusCode, body::Incoming};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use http_body_util::{Full, BodyExt};
 use bytes::Bytes;
 use tokio::net::TcpListener;
 
@@ -37,22 +38,31 @@ impl HttpProxy {
     }
 }
 
-async fn proxy_handler(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn proxy_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+
     match *req.method() {
         Method::CONNECT => {
-            // For now, we'll return a 501 Not Implemented for CONNECT requests
             Ok(Response::builder()
                 .status(StatusCode::NOT_IMPLEMENTED)
                 .body(Full::new(Bytes::from("CONNECT method not implemented")))
                 .unwrap())
         }
         _ => {
-            // For regular HTTP requests, we'll return a 200 OK with the requested URI
-            let uri = req.uri().to_string();
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from(format!("Received request for: {}", uri))))
-                .unwrap())
+            match client.request(req).await {
+                Ok(response) => {
+                    let (parts, body) = response.into_parts();
+                    let bytes = body.collect().await.unwrap_or_default().to_bytes();
+                    Ok(Response::from_parts(parts, Full::new(bytes)))
+                }
+                Err(e) => {
+                    eprintln!("Error forwarding request: {}", e);
+                    Ok(Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Full::new(Bytes::from(format!("Error: {}", e))))
+                        .unwrap())
+                }
+            }
         }
     }
 } 
